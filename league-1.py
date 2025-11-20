@@ -149,31 +149,72 @@ class Game:
         actions = []
 
         #######################
+        # Strategy: Build connections AND disrupt opponent tracks
 
-        source_town = None
-        target_town_id = None
+        # 1. Find first region with opponent tracks (no town) and disrupt it
+        foe_id = 1 - self.my_id
+        region_to_disrupt = None
 
-        for town in self.towns:
-            if town.desired_connections:
-                source_town = town
-                target_town_id = town.desired_connections[0]
-                break
+        for region_id, region in self.region_by_id.items():
+            if region.inked or region.has_town:
+                continue  # Skip inked regions and regions with towns
 
-        if source_town and target_town_id is not None:
-            # Find the target town
-            target_town = None
-            for town in self.towns:
-                if town.id == target_town_id:
-                    target_town = town
+            # Check if opponent has tracks in this region
+            has_foe_tracks = False
+            for coord in region.coords:
+                tile = self.grid.tiles[coord.y][coord.x]
+                if tile.tracks_owner == foe_id:
+                    has_foe_tracks = True
                     break
 
-            if target_town:
-                # Use AUTOPLACE to create the cheapest path
-                action = f"AUTOPLACE {source_town.coord.x} {source_town.coord.y} {target_town.coord.x} {target_town.coord.y}"
-                actions.append(action)
+            # Found a valid target - disrupt it
+            if has_foe_tracks:
+                region_to_disrupt = region_id
+                break
+
+        # Disrupt the target region
+        if region_to_disrupt is not None:
+            actions.append(f"DISRUPT {region_to_disrupt}")
+            region = self.region_by_id[region_to_disrupt]
+            if region.instability + 1 >= 3:
+                actions.append(f"MESSAGE Inking out region {region_to_disrupt}!")
+            else:
                 actions.append(
-                    f"MESSAGE Connecting town {source_town.id} to {target_town.id}"
+                    f"MESSAGE Disrupting region {region_to_disrupt} ({region.instability + 1}/3)"
                 )
+
+        # 2. Build connections - try to connect multiple towns
+        connections_attempted = 0
+        for town in self.towns:
+            if not town.desired_connections:
+                continue
+
+            for target_town_id in town.desired_connections:
+                # Find the target town
+                target_town = None
+                for t in self.towns:
+                    if t.id == target_town_id:
+                        target_town = t
+                        break
+
+                if target_town:
+                    # Check if connection already exists by looking at the source town tile
+                    source_tile = self.grid.tiles[town.coord.y][town.coord.x]
+                    already_connected = False
+                    for conn in source_tile.part_of_active_connections:
+                        if conn.from_id == town.id and conn.to_id == target_town_id:
+                            already_connected = True
+                            break
+
+                    if not already_connected:
+                        # Use AUTOPLACE to create the cheapest path
+                        action = f"AUTOPLACE {town.coord.x} {town.coord.y} {target_town.coord.x} {target_town.coord.y}"
+                        actions.append(action)
+                        connections_attempted += 1
+                        break  # Try one connection per town per turn
+
+            if connections_attempted >= 2:  # Limit attempts to avoid spam
+                break
 
         #######################
 
