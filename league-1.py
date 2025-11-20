@@ -192,14 +192,59 @@ class Game:
 
         return total_cost
 
+    def calculate_connection_value(self, path: List[Coord], cost: int) -> float:
+        """Calculate strategic value of a connection.
+
+        Higher value = better investment
+        Factors: points per turn, completion speed, defensive stability
+
+        Args:
+            path: Path coordinates for the connection
+            cost: Paint cost to complete
+
+        Returns:
+            Value score (higher is better)
+        """
+        if cost == 0:
+            return float("inf")  # Already complete, infinite value
+
+        # Count how many of our tracks are already in the path
+        my_tracks = sum(
+            1
+            for coord in path
+            if self.grid.tiles[coord.y][coord.x].tracks_owner == self.my_id
+        )
+
+        # Points per turn once connected (1 point per our track)
+        potential_points_per_turn = len(path)  # Full path value
+
+        # Turns to complete (assuming 3 points per turn)
+        turns_to_complete = max(1, (cost + 2) // 3)
+
+        # Penalize paths through unstable regions
+        instability_penalty = 0
+        for coord in path:
+            region = self.get_region_at(coord)
+            if region.instability >= 1:
+                instability_penalty += region.instability * 2
+
+        # Value = (points per turn / turns to complete) - instability risk + progress bonus
+        value = (
+            (potential_points_per_turn / turns_to_complete)
+            - instability_penalty
+            + (my_tracks * 2)
+        )
+
+        return value
+
     def get_prioritized_connections(self) -> List[tuple]:
-        """Get list of connections ordered by cost to complete.
+        """Get list of connections ordered by strategic value.
 
         Recalculates paths based on current game state (inked regions, etc.)
 
         Returns:
-            List of (from_town_id, to_town_id, cost, path) tuples,
-            sorted by cost (cheapest first)
+            List of (from_town_id, to_town_id, cost, path, value) tuples,
+            sorted by value (highest first)
         """
         connections = []
 
@@ -231,10 +276,11 @@ class Game:
                     continue
 
                 cost = self.calculate_path_cost(path)
-                connections.append((town.id, target_id, cost, path))
+                value = self.calculate_connection_value(path, cost)
+                connections.append((town.id, target_id, cost, path, value))
 
-        # Sort by cost (cheapest first)
-        connections.sort(key=lambda x: x[2])
+        # Sort by value (highest value first)
+        connections.sort(key=lambda x: x[4], reverse=True)
         return connections
 
     def find_cheapest_placeable_tiles(
@@ -280,10 +326,11 @@ class Game:
     def find_best_region_to_disrupt(self) -> int | None:
         """Find the best region to disrupt based on strategic value.
 
-        Priority:
-        1. Regions with active opponent connections (highest value)
-        2. Regions where opponent has more tracks than us
-        3. Cannot disrupt regions with towns or already inked
+        Smart targeting:
+        - Calculates actual points opponent loses per turn
+        - Prioritizes high-scoring active connections
+        - Considers how close region is to being inked
+        - Adapts based on score differential
 
         Returns:
             Region ID to disrupt, or None if no valid target
@@ -292,6 +339,10 @@ class Game:
         best_region = None
         best_score = -1
 
+        # Score differential affects aggression
+        score_diff = self.my_score - self.foe_score
+        losing_badly = score_diff < -10
+
         for region_id, region in self.region_by_id.items():
             # Skip invalid targets
             if region.has_town or region.inked or region.instability >= 3:
@@ -299,7 +350,8 @@ class Game:
 
             my_tracks = 0
             foe_tracks = 0
-            has_active_connection = False
+            active_connection_value = 0
+            unique_connections = set()
 
             for coord in region.coords:
                 tile = self.grid.tiles[coord.y][coord.x]
@@ -310,29 +362,44 @@ class Game:
                 elif tile.tracks_owner == foe_id:
                     foe_tracks += 1
 
-                # Check for active opponent connections
+                # Calculate actual point impact of active connections
                 if tile.part_of_active_connections:
                     for conn in tile.part_of_active_connections:
-                        # Check if this is part of opponent's desired connection
-                        for town in self.towns:
-                            if (
-                                town.id == conn.from_id
-                                and conn.to_id in town.desired_connections
-                            ):
-                                # This is an active connection - very valuable target
-                                has_active_connection = True
-                                break
+                        conn_key = (conn.from_id, conn.to_id)
+                        if conn_key not in unique_connections:
+                            unique_connections.add(conn_key)
+                            # Each connection they lose costs them points per turn
+                            # Check if it's their desired connection
+                            for town in self.towns:
+                                if (
+                                    town.id == conn.from_id
+                                    and conn.to_id in town.desired_connections
+                                ):
+                                    # Count their tracks in this connection path
+                                    active_connection_value += foe_tracks * 10
 
             # Skip if opponent has no tracks here
             if foe_tracks == 0:
                 continue
 
             # Calculate disruption value
-            # Prioritize: active connections > track advantage
             score = 0
-            if has_active_connection:
-                score += 1000  # Very high priority for active connections
-            score += foe_tracks - my_tracks  # Prefer regions where opponent dominates
+
+            # Active connection value (points they lose per turn)
+            score += active_connection_value
+
+            # Track advantage (prefer regions where they dominate)
+            track_advantage = foe_tracks - my_tracks
+            score += track_advantage * 5
+
+            # Efficiency bonus: closer to inking = higher priority
+            turns_to_ink = 3 - region.instability
+            efficiency_bonus = (3 - turns_to_ink) * 20
+            score += efficiency_bonus
+
+            # If losing badly, be hyper-aggressive on active connections
+            if losing_badly and active_connection_value > 0:
+                score *= 2
 
             if score > best_score:
                 best_score = score
@@ -452,13 +519,14 @@ class Game:
     def game_turn(self):
         """Execute one turn of the game by deciding actions and outputting them.
 
-        Strategy:
-        1. Disrupt: Target regions with opponent connections or track advantage
-        2. Build: Prioritize completing cheapest connections
+        KILLER Strategy:
+        1. Disrupt: Smart targeting based on point impact and score differential
+        2. Build: Value-based priorities (points/turn, not just cost)
+        3. Adapt: Aggressive when behind, defensive when ahead
 
         Outputs to stdout:
-        - DISRUPT action for strategic sabotage
-        - PLACE_TRACKS actions for optimal tile placement
+        - DISRUPT action for maximum damage
+        - PLACE_TRACKS actions for optimal ROI
         - MESSAGE actions for debugging
         - WAIT if no actions available
         """
@@ -481,30 +549,29 @@ class Game:
         prioritized = self.get_prioritized_connections()
 
         if prioritized:
-            # Focus on the cheapest connection
-            from_id, to_id, cost, path = prioritized[0]
+            # Try multiple connections in value priority order
+            for from_id, to_id, cost, path, value in prioritized[:3]:
+                tiles_to_place = self.find_cheapest_placeable_tiles(path, paint_points)
 
-            # Find cheapest tiles to place within this path
-            tiles_to_place = self.find_cheapest_placeable_tiles(path, paint_points)
+                if tiles_to_place:
+                    for coord in tiles_to_place:
+                        actions.append(f"PLACE_TRACKS {coord.x} {coord.y}")
 
-            if tiles_to_place:
-                for coord in tiles_to_place:
-                    actions.append(f"PLACE_TRACKS {coord.x} {coord.y}")
-
-                actions.append(f"MESSAGE Building {from_id}->{to_id} (cost:{cost})")
-            else:
-                # Path might be blocked or already complete, try next connection
-                for from_id, to_id, cost, path in prioritized[1:3]:  # Try next 2
-                    tiles_to_place = self.find_cheapest_placeable_tiles(
-                        path, paint_points
-                    )
-                    if tiles_to_place:
-                        for coord in tiles_to_place:
-                            actions.append(f"PLACE_TRACKS {coord.x} {coord.y}")
+                    # Strategic messaging based on score
+                    score_diff = self.my_score - self.foe_score
+                    if score_diff < -5:
                         actions.append(
-                            f"MESSAGE Building {from_id}->{to_id} (cost:{cost})"
+                            f"MESSAGE AGGRESSIVE: {from_id}->{to_id} V:{value:.1f}"
                         )
-                        break
+                    elif score_diff > 5:
+                        actions.append(
+                            f"MESSAGE DOMINATING: {from_id}->{to_id} V:{value:.1f}"
+                        )
+                    else:
+                        actions.append(
+                            f"MESSAGE Building {from_id}->{to_id} V:{value:.1f}"
+                        )
+                    break
 
         #######################
 
