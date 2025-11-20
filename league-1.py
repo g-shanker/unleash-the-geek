@@ -52,9 +52,18 @@ class TrackEquationWeights:
     """Weights for calculating track placement scores."""
 
     base_score: float = 100.0
-    terrain_cost_weight: float = -10.0
-    region_has_town_weight: float = 5.0
-    on_shortest_path_weight: float = 25.0
+    terrain_cost_weight: float = (
+        -5.0
+    )  # REDUCED: was -10.0 (obs #3: too afraid of mountains)
+    region_has_town_weight: float = (
+        2.0  # REDUCED: was 5.0 (obs #1: too much priority on town regions)
+    )
+    on_shortest_path_weight: float = (
+        40.0  # INCREASED: was 25.0 (obs #2: focus more on shortest paths)
+    )
+    adjacent_to_my_track_weight: float = (
+        25.0  # NEW: bonus for connecting to existing tracks (builds continuous paths)
+    )
     instability_weight: float = -15.0
     existing_track_penalty: float = -1000.0
     inked_penalty: float = -2000.0
@@ -67,6 +76,9 @@ class DisruptionEquationWeights:
     base_score: float = 50.0
     opponent_tracks_weight: float = 30.0
     my_tracks_weight: float = -50.0
+    adjacent_to_town_weight: float = (
+        20.0  # BONUS: disrupt regions bordering towns (strategic)
+    )
     already_inked_penalty: float = -3000.0
 
 
@@ -154,6 +166,17 @@ class Game:
     foe_score: int
     track_weights: TrackEquationWeights
     disruption_weights: DisruptionEquationWeights
+    shortest_path_tiles: set[
+        Coord
+    ]  # Cache of all tiles on shortest paths between desired towns
+
+    # Pre-computed data structures for faster turn processing
+    region_adjacency: Dict[int, set[int]]  # region_id -> set of adjacent region_ids
+    town_coords: set[Coord]  # All town coordinates for quick lookup
+    all_neighbors_cache: Dict[
+        Coord, List[Coord]
+    ]  # coord -> list of valid neighbors (ignoring inked)
+    regions_adjacent_to_towns: set[int]  # region_ids that border town regions
 
     # ===== Grid and Tile Access Methods =====
 
@@ -186,7 +209,12 @@ class Game:
 
     def get_neighbors(self, coord: Coord) -> List[Coord]:
         """Get orthogonally adjacent neighbors that are passable."""
-        # Priority order: NORTH, EAST, SOUTH, WEST (as per game rules)
+        # Use pre-computed neighbors, filter by passable (inked status changes)
+        if coord in self.all_neighbors_cache:
+            return [
+                n for n in self.all_neighbors_cache[coord] if not self.get_tile(n).inked
+            ]
+        # Fallback for coordinates not in cache
         directions = [
             Coord(coord.x, coord.y - 1),  # NORTH
             Coord(coord.x + 1, coord.y),  # EAST
@@ -213,6 +241,13 @@ class Game:
         # Initialize with default weights (can be tuned later)
         self.track_weights = TrackEquationWeights()
         self.disruption_weights = DisruptionEquationWeights()
+        self.shortest_path_tiles = (
+            set()
+        )  # Will be populated after grid is fully initialized
+        self.region_adjacency = {}
+        self.town_coords = set()
+        self.all_neighbors_cache = {}
+        self.regions_adjacent_to_towns = set()
 
         for i in range(height):
             row: List[Tile] = []
@@ -254,6 +289,13 @@ class Game:
             town = Town(town_id, coord, desired_connections)
             self.towns.append(town)
             self.get_region_at(coord).has_town = True
+            self.town_coords.add(coord)
+
+        # Pre-compute static data structures during initialization (1000ms available)
+        self._precompute_static_data()
+
+        # Compute shortest paths between all desired town connections
+        self._compute_shortest_paths_between_towns()
 
     def parse(self):
         self.my_score = int(input())
@@ -285,6 +327,9 @@ class Game:
                 tile.inked = inked
                 tile.instability = instability
                 tile.part_of_active_connections = connections
+
+        # Recompute shortest paths each turn to account for disrupted regions
+        self._compute_shortest_paths_between_towns()
 
     # ===== SCORING SYSTEM METHODS =====
 
@@ -321,7 +366,11 @@ class Game:
         if self._is_on_shortest_path_between_towns(coord):
             score += w.on_shortest_path_weight
 
-        # 4. Instability (negative, risky regions)
+        # 4. Adjacent to my existing tracks (positive, builds continuous paths)
+        if self._is_adjacent_to_my_track(coord):
+            score += w.adjacent_to_my_track_weight
+
+        # 5. Instability (negative, risky regions)
         score += w.instability_weight * tile.instability
 
         return score
@@ -340,6 +389,10 @@ class Game:
         if region.is_destroyed():
             return w.already_inked_penalty
 
+        # Can't disrupt regions with towns
+        if region.has_town:
+            return w.already_inked_penalty
+
         score = w.base_score
 
         # 1. Number of opponent tracks (positive, damage opponent)
@@ -347,6 +400,10 @@ class Game:
         my_tracks, opponent_tracks, _ = self._count_tracks_in_region(region)
         score += w.opponent_tracks_weight * opponent_tracks
         score += w.my_tracks_weight * my_tracks
+
+        # 3. Bonus for regions adjacent to towns (strategic disruption)
+        if self._is_adjacent_to_town_region(region):
+            score += w.adjacent_to_town_weight
 
         return score
 
@@ -422,35 +479,112 @@ class Game:
 
     def _is_on_shortest_path_between_towns(self, coord: Coord) -> bool:
         """
-        Check if coord is on the shortest path between any pair of towns with desired connections.
-        Uses simple Manhattan distance heuristic (cheap approximation).
+        Check if coord is on any computed shortest path between towns with desired connections.
+        Uses cached shortest paths computed during initialization.
         """
+        return coord in self.shortest_path_tiles
+
+    def _compute_shortest_paths_between_towns(self):
+        """
+        Compute all shortest paths between towns with desired connections using BFS.
+        Populates self.shortest_path_tiles with all coordinates on these paths.
+        """
+        self.shortest_path_tiles = set()
+
         for town in self.towns:
             for desired_id in town.desired_connections:
                 target_town = self.get_town_by_id(desired_id)
                 if target_town:
-                    # Check if coord is roughly on the straight line between the two towns
-                    dist_town_to_target = abs(town.coord.x - target_town.coord.x) + abs(
-                        town.coord.y - target_town.coord.y
+                    # Find shortest path from town to target_town using BFS
+                    path_coords = self._find_shortest_path_bfs(
+                        town.coord, target_town.coord
                     )
-                    dist_town_to_coord = abs(town.coord.x - coord.x) + abs(
-                        town.coord.y - coord.y
-                    )
-                    dist_coord_to_target = abs(coord.x - target_town.coord.x) + abs(
-                        coord.y - target_town.coord.y
-                    )
+                    if path_coords:
+                        self.shortest_path_tiles.update(path_coords)
 
-                    # If coord is on or near the path, distances should sum to approximately the direct distance
-                    if (
-                        dist_town_to_coord + dist_coord_to_target
-                        <= dist_town_to_target + 2
-                    ):
-                        return True
-        return False
+    def _precompute_static_data(self):
+        """Pre-compute static data structures during initialization to speed up turn processing."""
+        # 1. Pre-compute all valid neighbors for every coordinate (ignoring inked status)
+        for y in range(self.grid.height):
+            for x in range(self.grid.width):
+                coord = Coord(x, y)
+                directions = [
+                    Coord(coord.x, coord.y - 1),  # NORTH
+                    Coord(coord.x + 1, coord.y),  # EAST
+                    Coord(coord.x, coord.y + 1),  # SOUTH
+                    Coord(coord.x - 1, coord.y),  # WEST
+                ]
+                self.all_neighbors_cache[coord] = [
+                    d for d in directions if self.is_valid_coord(d)
+                ]
+
+        # 2. Pre-compute region adjacency graph
+        for region_id in self.region_by_id:
+            self.region_adjacency[region_id] = set()
+
+        for y in range(self.grid.height):
+            for x in range(self.grid.width):
+                coord = Coord(x, y)
+                tile = self.get_tile(coord)
+                region_id = tile.region_id
+
+                # Check all neighbors for different regions
+                for neighbor_coord in self.all_neighbors_cache[coord]:
+                    neighbor_tile = self.get_tile(neighbor_coord)
+                    if neighbor_tile.region_id != region_id:
+                        self.region_adjacency[region_id].add(neighbor_tile.region_id)
+
+        # 3. Pre-compute which regions are adjacent to town regions
+        for region_id, region in self.region_by_id.items():
+            if region.has_town:
+                # All regions adjacent to this town region
+                for adj_region_id in self.region_adjacency[region_id]:
+                    self.regions_adjacent_to_towns.add(adj_region_id)
+
+    def _find_shortest_path_bfs(self, start: Coord, goal: Coord) -> List[Coord]:
+        """
+        Find shortest path between two coordinates using BFS.
+        Returns list of coordinates on the path (excluding start and goal which are towns).
+        """
+        if start == goal:
+            return []
+
+        queue = deque([(start, [start])])
+        visited = {start}
+
+        while queue:
+            current, path = queue.popleft()
+
+            if current == goal:
+                # Return path excluding the start and goal (town locations)
+                return path[1:-1]
+
+            for neighbor in self.get_neighbors(current):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+
+        # No path found
+        return []
 
     def _is_town_location(self, coord: Coord) -> bool:
         """Check if coordinate is a town location."""
-        return any(town.coord == coord for town in self.towns)
+        return coord in self.town_coords
+
+    def _is_adjacent_to_town_region(self, region: Region) -> bool:
+        """Check if this region borders any region that contains a town."""
+        return region.id in self.regions_adjacent_to_towns
+
+    def _is_adjacent_to_my_track(self, coord: Coord) -> bool:
+        """Check if coordinate is adjacent to any of player's existing tracks."""
+        if coord not in self.all_neighbors_cache:
+            return False
+
+        for neighbor in self.all_neighbors_cache[coord]:
+            neighbor_tile = self.get_tile(neighbor)
+            if neighbor_tile.is_my_track(self.my_id):
+                return True
+        return False
 
     # ===== GAME TURN METHODS =====
 
