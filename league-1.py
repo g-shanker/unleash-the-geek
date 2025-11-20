@@ -277,6 +277,69 @@ class Game:
 
         return selected
 
+    def find_best_region_to_disrupt(self) -> int | None:
+        """Find the best region to disrupt based on strategic value.
+
+        Priority:
+        1. Regions with active opponent connections (highest value)
+        2. Regions where opponent has more tracks than us
+        3. Cannot disrupt regions with towns or already inked
+
+        Returns:
+            Region ID to disrupt, or None if no valid target
+        """
+        foe_id = 1 - self.my_id
+        best_region = None
+        best_score = -1
+
+        for region_id, region in self.region_by_id.items():
+            # Skip invalid targets
+            if region.has_town or region.inked or region.instability >= 3:
+                continue
+
+            my_tracks = 0
+            foe_tracks = 0
+            has_active_connection = False
+
+            for coord in region.coords:
+                tile = self.grid.tiles[coord.y][coord.x]
+
+                # Count tracks
+                if tile.tracks_owner == self.my_id:
+                    my_tracks += 1
+                elif tile.tracks_owner == foe_id:
+                    foe_tracks += 1
+
+                # Check for active opponent connections
+                if tile.part_of_active_connections:
+                    for conn in tile.part_of_active_connections:
+                        # Check if this is part of opponent's desired connection
+                        for town in self.towns:
+                            if (
+                                town.id == conn.from_id
+                                and conn.to_id in town.desired_connections
+                            ):
+                                # This is an active connection - very valuable target
+                                has_active_connection = True
+                                break
+
+            # Skip if opponent has no tracks here
+            if foe_tracks == 0:
+                continue
+
+            # Calculate disruption value
+            # Prioritize: active connections > track advantage
+            score = 0
+            if has_active_connection:
+                score += 1000  # Very high priority for active connections
+            score += foe_tracks - my_tracks  # Prefer regions where opponent dominates
+
+            if score > best_score:
+                best_score = score
+                best_region = region_id
+
+        return best_region
+
     def init(self):
         """Initialize the game by reading the initial game state.
 
@@ -390,11 +453,11 @@ class Game:
         """Execute one turn of the game by deciding actions and outputting them.
 
         Strategy:
-        Focus on building tracks efficiently by:
-        1. Prioritizing connections that can be completed soonest (lowest cost)
-        2. Placing tracks on cheapest available tiles within those paths
+        1. Disrupt: Target regions with opponent connections or track advantage
+        2. Build: Prioritize completing cheapest connections
 
         Outputs to stdout:
+        - DISRUPT action for strategic sabotage
         - PLACE_TRACKS actions for optimal tile placement
         - MESSAGE actions for debugging
         - WAIT if no actions available
@@ -403,9 +466,18 @@ class Game:
         paint_points = 3  # Available per turn
 
         #######################
-        # Strategy: Build cheapest connections first
+        # Strategy: Disrupt opponent, then build our connections
 
-        # Get connections ordered by cost to complete
+        # 1. Find and disrupt best target region
+        region_to_disrupt = self.find_best_region_to_disrupt()
+        if region_to_disrupt is not None:
+            actions.append(f"DISRUPT {region_to_disrupt}")
+            region = self.region_by_id[region_to_disrupt]
+            actions.append(
+                f"MESSAGE Disrupting region {region_to_disrupt} ({region.instability + 1}/3)"
+            )
+
+        # 2. Build cheapest connections
         prioritized = self.get_prioritized_connections()
 
         if prioritized:
