@@ -63,9 +63,30 @@ class Game:
     foe_score: int
 
     def get_region_at(self, coord: Coord) -> Region:
+        """Get the region object at the specified coordinate.
+
+        Args:
+            coord: The x,y coordinate on the grid
+
+        Returns:
+            Region object containing information about the region at that location
+        """
         return self.region_by_id[self.grid.tiles[coord.y][coord.x].region_id]
 
     def init(self):
+        """Initialize the game by reading the initial game state.
+
+        Reads from stdin:
+        - Player ID (0 or 1)
+        - Grid dimensions (width x height)
+        - Region and terrain type for each cell
+        - Town count and details (id, position, desired connections)
+
+        Sets up:
+        - Grid with all tiles and their properties
+        - Region mapping with coordinates
+        - Town list with desired connections
+        """
         self.my_id = int(input())  # 0 or 1
         width = int(input())  # map size
         height = int(input())
@@ -115,6 +136,17 @@ class Game:
             self.get_region_at(coord).has_town = True
 
     def parse(self):
+        """Parse the current turn state from stdin.
+
+        Reads from stdin:
+        - Current scores for both players
+        - For each cell: track owner, instability, inked status, active connections
+
+        Updates:
+        - Player scores
+        - Tile states (tracks, instability, connections)
+        - Region states derived from tile data
+        """
         self.my_score = int(input())
         self.foe_score = int(input())
         for i in range(self.grid.height):
@@ -146,6 +178,18 @@ class Game:
                 tile.part_of_active_connections = connections
 
     def game_turn(self):
+        """Execute one turn of the game by deciding actions and outputting them.
+
+        Strategy:
+        1. Disrupt: Find first region with opponent tracks (no town) and disrupt it
+        2. Build: Attempt to create connections between towns using AUTOPLACE
+
+        Outputs to stdout:
+        - DISRUPT action if opponent tracks found in vulnerable region
+        - AUTOPLACE actions for up to 2 town connections that don't exist yet
+        - MESSAGE actions for debugging
+        - WAIT if no actions available
+        """
         actions = []
 
         #######################
@@ -225,6 +269,12 @@ class Game:
 
 
 def main():
+    """Main game loop.
+
+    Initializes the game once, then continuously:
+    1. Parses the current turn state
+    2. Executes game turn logic to output actions
+    """
     game = Game()
     game.init()
     while True:
