@@ -73,6 +73,210 @@ class Game:
         """
         return self.region_by_id[self.grid.tiles[coord.y][coord.x].region_id]
 
+    def find_shortest_path(self, from_coord: Coord, to_coord: Coord) -> List[Coord]:
+        """Find the shortest path between two coordinates using BFS.
+
+        Follows the game's path priority rules: NORTH > EAST > SOUTH > WEST
+        when multiple equally short paths exist.
+
+        Args:
+            from_coord: Starting coordinate
+            to_coord: Destination coordinate
+
+        Returns:
+            List of coordinates representing the shortest path (excluding start, including end)
+            Empty list if no path exists
+        """
+        from collections import deque
+
+        if from_coord == to_coord:
+            return []
+
+        # BFS queue: (current_coord, path)
+        queue = deque([(from_coord, [])])
+        visited = {from_coord}
+
+        # Direction priority: NORTH, EAST, SOUTH, WEST
+        directions = [
+            (0, -1),  # NORTH
+            (1, 0),  # EAST
+            (0, 1),  # SOUTH
+            (-1, 0),  # WEST
+        ]
+
+        while queue:
+            current, path = queue.popleft()
+
+            # Try all directions in priority order
+            for dx, dy in directions:
+                next_x = current.x + dx
+                next_y = current.y + dy
+
+                # Check bounds
+                if not (
+                    0 <= next_x < self.grid.width and 0 <= next_y < self.grid.height
+                ):
+                    continue
+
+                next_coord = Coord(next_x, next_y)
+
+                # Skip if already visited
+                if next_coord in visited:
+                    continue
+
+                # Skip if region is inked out or about to be inked (instability >= 2)
+                tile = self.grid.tiles[next_y][next_x]
+                region = self.get_region_at(next_coord)
+                if tile.inked or region.instability >= 2:
+                    continue
+
+                visited.add(next_coord)
+                new_path = path + [next_coord]
+
+                # Found destination
+                if next_coord == to_coord:
+                    return new_path
+
+                queue.append((next_coord, new_path))
+
+        return []  # No path found
+
+    def find_all_desired_paths(self) -> Dict[tuple, List[Coord]]:
+        """Find shortest paths for all desired town connections.
+
+        Returns:
+            Dictionary mapping (from_town_id, to_town_id) tuples to path coordinates.
+            Path includes all cells between towns (excluding town cells themselves).
+        """
+        paths = {}
+
+        for town in self.towns:
+            for target_id in town.desired_connections:
+                # Find target town
+                target_town = None
+                for t in self.towns:
+                    if t.id == target_id:
+                        target_town = t
+                        break
+
+                if target_town:
+                    path = self.find_shortest_path(town.coord, target_town.coord)
+                    # Store path without the town coordinates themselves
+                    # (path already excludes start, includes end which is the target town)
+                    paths[(town.id, target_id)] = path[:-1] if path else []
+
+        return paths
+
+    def calculate_path_cost(self, path: List[Coord]) -> int:
+        """Calculate the total paint cost to complete a path.
+
+        Tiles with existing tracks (any player or neutral) cost 0.
+        Only counts tiles where we need to place new tracks.
+
+        Args:
+            path: List of coordinates representing the path
+
+        Returns:
+            Total paint points needed to complete this path
+        """
+        # Terrain type to cost mapping
+        terrain_costs = {0: 1, 1: 2, 2: 3, 3: 3}  # plains, river, mountain, POI
+
+        total_cost = 0
+        for coord in path:
+            tile = self.grid.tiles[coord.y][coord.x]
+            # If any track exists, cost is 0 (can use it for connections)
+            if tile.tracks_owner == -1:
+                # No track exists, need to place one
+                total_cost += terrain_costs.get(tile.type, 1)
+
+        return total_cost
+
+    def get_prioritized_connections(self) -> List[tuple]:
+        """Get list of connections ordered by cost to complete.
+
+        Recalculates paths based on current game state (inked regions, etc.)
+
+        Returns:
+            List of (from_town_id, to_town_id, cost, path) tuples,
+            sorted by cost (cheapest first)
+        """
+        connections = []
+
+        for town in self.towns:
+            for target_id in town.desired_connections:
+                # Check if already connected
+                source_tile = self.grid.tiles[town.coord.y][town.coord.x]
+                already_connected = any(
+                    conn.from_id == town.id and conn.to_id == target_id
+                    for conn in source_tile.part_of_active_connections
+                )
+
+                if already_connected:
+                    continue
+
+                # Find target town
+                target_town = next((t for t in self.towns if t.id == target_id), None)
+                if not target_town:
+                    continue
+
+                # Recalculate path based on current state
+                path = self.find_shortest_path(town.coord, target_town.coord)
+                if not path:
+                    continue
+
+                # Remove town coordinates from path (only track cells)
+                path = path[:-1] if path else []
+                if not path:
+                    continue
+
+                cost = self.calculate_path_cost(path)
+                connections.append((town.id, target_id, cost, path))
+
+        # Sort by cost (cheapest first)
+        connections.sort(key=lambda x: x[2])
+        return connections
+
+    def find_cheapest_placeable_tiles(
+        self, path: List[Coord], max_points: int
+    ) -> List[Coord]:
+        """Find the cheapest tiles in a path where we can place tracks.
+
+        Args:
+            path: List of coordinates in the path
+            max_points: Maximum paint points available
+
+        Returns:
+            List of coordinates to place tracks on, using up to max_points
+        """
+        # Terrain type to cost mapping
+        terrain_costs = {0: 1, 1: 2, 2: 3, 3: 3}
+
+        # Filter to tiles that need tracks and are placeable
+        placeable = []
+        for coord in path:
+            tile = self.grid.tiles[coord.y][coord.x]
+            region = self.get_region_at(coord)
+            # Can place if no track exists, region isn't inked, and not too disrupted
+            # Avoid placing in regions with instability >= 2 (will be inked next disruption)
+            if tile.tracks_owner == -1 and not tile.inked and region.instability < 2:
+                cost = terrain_costs.get(tile.type, 1)
+                placeable.append((coord, cost))
+
+        # Sort by cost (cheapest first)
+        placeable.sort(key=lambda x: x[1])
+
+        # Greedily select tiles within budget
+        selected = []
+        remaining_points = max_points
+
+        for coord, cost in placeable:
+            if cost <= remaining_points:
+                selected.append(coord)
+                remaining_points -= cost
+
+        return selected
+
     def init(self):
         """Initialize the game by reading the initial game state.
 
@@ -177,88 +381,58 @@ class Game:
                 tile.instability = instability
                 tile.part_of_active_connections = connections
 
+                # Update region state from tile data
+                region = self.region_by_id[tile.region_id]
+                region.instability = instability
+                region.inked = inked
+
     def game_turn(self):
         """Execute one turn of the game by deciding actions and outputting them.
 
         Strategy:
-        1. Disrupt: Find first region with opponent tracks (no town) and disrupt it
-        2. Build: Attempt to create connections between towns using AUTOPLACE
+        Focus on building tracks efficiently by:
+        1. Prioritizing connections that can be completed soonest (lowest cost)
+        2. Placing tracks on cheapest available tiles within those paths
 
         Outputs to stdout:
-        - DISRUPT action if opponent tracks found in vulnerable region
-        - AUTOPLACE actions for up to 2 town connections that don't exist yet
+        - PLACE_TRACKS actions for optimal tile placement
         - MESSAGE actions for debugging
         - WAIT if no actions available
         """
         actions = []
+        paint_points = 3  # Available per turn
 
         #######################
-        # Strategy: Build connections AND disrupt opponent tracks
+        # Strategy: Build cheapest connections first
 
-        # 1. Find first region with opponent tracks (no town) and disrupt it
-        foe_id = 1 - self.my_id
-        region_to_disrupt = None
+        # Get connections ordered by cost to complete
+        prioritized = self.get_prioritized_connections()
 
-        for region_id, region in self.region_by_id.items():
-            if region.inked or region.has_town:
-                continue  # Skip inked regions and regions with towns
+        if prioritized:
+            # Focus on the cheapest connection
+            from_id, to_id, cost, path = prioritized[0]
 
-            # Check if opponent has tracks in this region
-            has_foe_tracks = False
-            for coord in region.coords:
-                tile = self.grid.tiles[coord.y][coord.x]
-                if tile.tracks_owner == foe_id:
-                    has_foe_tracks = True
-                    break
+            # Find cheapest tiles to place within this path
+            tiles_to_place = self.find_cheapest_placeable_tiles(path, paint_points)
 
-            # Found a valid target - disrupt it
-            if has_foe_tracks:
-                region_to_disrupt = region_id
-                break
+            if tiles_to_place:
+                for coord in tiles_to_place:
+                    actions.append(f"PLACE_TRACKS {coord.x} {coord.y}")
 
-        # Disrupt the target region
-        if region_to_disrupt is not None:
-            actions.append(f"DISRUPT {region_to_disrupt}")
-            region = self.region_by_id[region_to_disrupt]
-            if region.instability + 1 >= 3:
-                actions.append(f"MESSAGE Inking out region {region_to_disrupt}!")
+                actions.append(f"MESSAGE Building {from_id}->{to_id} (cost:{cost})")
             else:
-                actions.append(
-                    f"MESSAGE Disrupting region {region_to_disrupt} ({region.instability + 1}/3)"
-                )
-
-        # 2. Build connections - try to connect multiple towns
-        connections_attempted = 0
-        for town in self.towns:
-            if not town.desired_connections:
-                continue
-
-            for target_town_id in town.desired_connections:
-                # Find the target town
-                target_town = None
-                for t in self.towns:
-                    if t.id == target_town_id:
-                        target_town = t
+                # Path might be blocked or already complete, try next connection
+                for from_id, to_id, cost, path in prioritized[1:3]:  # Try next 2
+                    tiles_to_place = self.find_cheapest_placeable_tiles(
+                        path, paint_points
+                    )
+                    if tiles_to_place:
+                        for coord in tiles_to_place:
+                            actions.append(f"PLACE_TRACKS {coord.x} {coord.y}")
+                        actions.append(
+                            f"MESSAGE Building {from_id}->{to_id} (cost:{cost})"
+                        )
                         break
-
-                if target_town:
-                    # Check if connection already exists by looking at the source town tile
-                    source_tile = self.grid.tiles[town.coord.y][town.coord.x]
-                    already_connected = False
-                    for conn in source_tile.part_of_active_connections:
-                        if conn.from_id == town.id and conn.to_id == target_town_id:
-                            already_connected = True
-                            break
-
-                    if not already_connected:
-                        # Use AUTOPLACE to create the cheapest path
-                        action = f"AUTOPLACE {town.coord.x} {town.coord.y} {target_town.coord.x} {target_town.coord.y}"
-                        actions.append(action)
-                        connections_attempted += 1
-                        break  # Try one connection per town per turn
-
-            if connections_attempted >= 2:  # Limit attempts to avoid spam
-                break
 
         #######################
 
